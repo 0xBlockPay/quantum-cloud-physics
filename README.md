@@ -13,6 +13,34 @@ averaging over the CCN spectrum.
 
 ![](./img/head.png)
 
+## What this project does
+
+WSM6-Q is a one-dimensional **warm-rain parcel model** of a single convective cloud element. It
+integrates, second by second, the vertical motion and thermodynamics of an air parcel rising
+through a prescribed environment, coupled to prognostic cloud microphysics:
+
+- **Thermodynamics (classical).** Pseudo-adiabatic ascent; buoyancy from the virtual-potential-
+  temperature difference `B = g(θ_vp − θ_ve)/θ_ve`; and an effective drag law `dw/dt = B − εw`
+  that closes the feedback loop *latent heat → T → buoyancy → w → supersaturation S*.
+- **CCN activation (classical scheme + quantum mean).** A log-normal aerosol spectrum of
+  N = 2^N_IDX dry-radius bins is activated with κ-Köhler theory in an A&G-inspired differential
+  form. The single number the microphysics needs — the *activated fraction*
+  f(S,T) = ⟨fᵢ⟩, the mean over the spectrum — is computed by a **quantum amplitude estimator**
+  (the only quantum call in the model).
+- **Microphysics (classical, driven by N_d = N_ccn·f).** Condensation (Twomey channel),
+  autoconversion with droplet-size dependence (Albrecht channel), accretion and rainout.
+
+**Inputs:** an environmental profile (θ, qv vs z) + CCN number concentration N_ccn + spectrum
+shape (r_mode, σ_g). **Outputs:** the parcel trajectory and cloud state over time — peak
+supersaturation S_peak, droplet concentration N_d, mean radius r̄, condensed water q_c, rain q_r:
+a miniature of the first-aerosol-forcing (Twomey/Albrecht) response that full 3-D models
+(WRF, ICON, IFS) compute with bulk schemes.
+
+The goal is not to beat those models but to isolate and *quantum-accelerate the single expensive
+average* — ⟨fᵢ⟩ over the CCN spectrum — that every one of them performs at each activation step.
+
+---
+
 ## What changed in v8 (the only scientific change)
 
 In v7 and earlier the activated fraction was averaged **uniformly over radius bins**
@@ -88,6 +116,81 @@ the v8 particle-weighted mean (blue) vs the v7 uniform radius-bin mean (grey das
   microphysics. Its advantage over classical summation applies in an oracle model where
   each fᵢ is expensive to compute (the full version uses an arithmetic oracle that
   computes S_crit(i) from |i⟩).
+
+---
+
+## What runs in CUDA-Q (the implementation)
+
+The quantum part is a shot-based **Iterative Amplitude Amplification (IAA)** estimator of
+⟨fᵢ⟩ = Σᵢ wᵢ fᵢ. Kernels are built with the CUDA-Q **builder API** (`cudaq.make_kernel()`), not
+generated as text, and run on the simulator backend; the same code targets hardware.
+
+```
+┌──────────────────────────────────────┐
+│ state prep                           │
+│ |psi> = SUM_i sqrt(w_i)|i>           │
+│ (N-1 controlled-RY + O(N) X gates)   │
+└───────────────────┬──────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────┐
+│ oracle O_f  (applied per bin i)      │
+│   X on the zero bits of i            │
+│   MCX(idx -> work)                   │
+│   CX(work->anc); RY(-sign*theta_i/2) │
+│   CX(work->anc); RY(+sign*theta_i/2) │
+│   MCX(idx -> work)      [uncompute]  │
+└───────────────────┬──────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────┐
+│ m x Grover iteration (m = 1..3)      │
+│   S_psi . O_f^dagger . S_G           │
+│   (diagnostics / decoding only)      │
+└──────────────────────────────────────┘
+        │
+        ▼
+   measure ancilla q[0]
+   P(a=1) = <f_i> = SUM_i w_i f_i
+
+ registers (N_IDX+2):  q[0]=ancilla | q[1..N_IDX]=index |i> | q[N_IDX+1]=work
+```
+
+### Qubit layout (N_IDX + 2 qubits)
+
+| Qubit | Role |
+|:---|:---|
+| `q[0]` | ancilla — **measured**; P(a=1) is the estimator output |
+| `q[1..N_IDX]` | index register, LSB = q[1]; holds \|i⟩ for bin i |
+| `q[N_IDX+1]` | work qubit (clean before and after each oracle call) |
+
+### Circuit (`build_iaa_ops`)
+
+- **State preparation** — recursive amplitude encoding (MSB→LSB): N−1 controlled-RY rotations +
+  O(N) X gates build \|ψ⟩ = Σᵢ √wᵢ \|i⟩. The CCN weights wᵢ are *baked constants* (the spectrum
+  shape is fixed at compile time). Verified by self-test [T11].
+- **Oracle O_f** — for each bin i, a phase-kickback gadget: X on the zero bits of i, an
+  MCX(idx→work), then `CX(work→anc); RY(−sign·θᵢ/2); CX(work→anc); RY(+sign·θᵢ/2)` on the ancilla,
+  and uncompute. The θᵢ = 2 asin √fᵢ are **runtime float kernel arguments** (2^N_IDX of them), so
+  one compiled kernel is reused for any S,T by passing new angles.
+- **Grover iterations (m = 1..3, diagnostics only)** — O_f · S_ψ · O_f† · S_G, with the reflection
+  about \|ψ⟩ and the diffuser `H·X·MCZ(all)·X·H`.
+
+### Gate set & multi-control gates
+
+Single-qubit: H, X, Z, RY. Multi-qubit: CNOT, **MCX** (multi-control X), **MCZ** (multi-control
+Z) and **multi-control CRY**. In the builder API `cx`/`cz`/`cry` accept a *list of control
+qubits*, so MCX/MCZ/multi-control-CRY are emitted natively — no Toffoli decomposition on this
+path. The `mock` backend and self-tests [T4/T4b] separately verify that the explicit Barenco-ladder
+decomposition is equivalent.
+
+### Sampling & scaling
+
+Each estimate draws `--shots` samples (`cudaq.sample(kernel, *angles, shots_count=shots)`) and
+reports the fraction with ancilla = 1. Resolution is set by `--n-idx`: bins = 2^N_IDX (default
+N_IDX = 6 → 64 bins); kernels are compiled once per (N_IDX, r_mode, σ_g) and cached. The `mock`
+backend is an exact state-vector simulator of the *same* native ops with binomial shot noise, used
+as the numerical reference.
 
 ---
 
